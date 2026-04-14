@@ -1,0 +1,7 @@
+# 默认忽略全部，只保留仓库必要文件
+*
+
+# 必要文件
+!.gitignore
+!README.md
+!xiqueer_timetable.py
