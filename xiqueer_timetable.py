@@ -366,11 +366,40 @@ def parse_weeks_expr(text: str) -> List[int]:
 
 def escape_ics_text(text: str) -> str:
     value = text or ""
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
     value = value.replace("\\", "\\\\")
     value = value.replace("\n", "\\n")
     value = value.replace(";", "\\;")
     value = value.replace(",", "\\,")
     return value
+
+
+def format_utc_offset(delta: timedelta) -> str:
+    total = int(delta.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    hh = total // 3600
+    mm = (total % 3600) // 60
+    return f"{sign}{hh:02d}{mm:02d}"
+
+
+def build_simple_vtimezone_lines(timezone_name: str, local_tz: ZoneInfo) -> List[str]:
+    # 生成一个固定偏移的 VTIMEZONE（对 Asia/Shanghai 等无夏令时时区稳定可用）。
+    probe = datetime.now(local_tz)
+    offset = probe.utcoffset() or timedelta(0)
+    offset_text = format_utc_offset(offset)
+    tz_name = probe.tzname() or timezone_name
+    return [
+        "BEGIN:VTIMEZONE",
+        f"TZID:{escape_ics_text(timezone_name)}",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        f"TZOFFSETFROM:{offset_text}",
+        f"TZOFFSETTO:{offset_text}",
+        f"TZNAME:{escape_ics_text(tz_name)}",
+        "END:STANDARD",
+        "END:VTIMEZONE",
+    ]
 
 
 def fold_ics_line(line: str, width: int = 75) -> List[str]:
@@ -964,6 +993,7 @@ def export_ics(
         "skip_no_period_time": 0,
     }
 
+    local_tz = ZoneInfo(timezone_name)
     lines: List[str] = [
         "BEGIN:VCALENDAR",
         "PRODID:-//xiqueer-csv//CN",
@@ -971,9 +1001,9 @@ def export_ics(
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
         f"X-WR-CALNAME:{escape_ics_text(calendar_name)}",
-        "X-WR-TIMEZONE:UTC",
+        f"X-WR-TIMEZONE:{escape_ics_text(timezone_name)}",
     ]
-    local_tz = ZoneInfo(timezone_name)
+    lines.extend(build_simple_vtimezone_lines(timezone_name, local_tz))
 
     event_count = 0
     for row in rows:
@@ -1025,8 +1055,8 @@ def export_ics(
                 dt_time(end_hour, end_minute),
                 tzinfo=local_tz,
             )
-            start_utc = start_local.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            end_utc = end_local.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            start_local_text = start_local.strftime("%Y%m%dT%H%M%S")
+            end_local_text = end_local.strftime("%Y%m%dT%H%M%S")
 
             uid_seed = (
                 f"{term_code}|{row.get('course_name', '')}|{row.get('teacher', '')}|"
@@ -1044,15 +1074,15 @@ def export_ics(
                 value = str(row.get(key, "") or "").strip()
                 if value:
                     desc_lines.append(f"{label}:{value}")
-            description = escape_ics_text("\\n".join(desc_lines))
+            description = escape_ics_text("\n".join(desc_lines))
 
             lines.extend(
                 [
                     "BEGIN:VEVENT",
                     f"UID:{uid}",
                     f"DTSTAMP:{now_utc}",
-                    f"DTSTART:{start_utc}",
-                    f"DTEND:{end_utc}",
+                    f"DTSTART;TZID={timezone_name}:{start_local_text}",
+                    f"DTEND;TZID={timezone_name}:{end_local_text}",
                     f"SUMMARY:{summary}",
                     f"LOCATION:{location}",
                     f"DESCRIPTION:{description}" if description else "DESCRIPTION:",
