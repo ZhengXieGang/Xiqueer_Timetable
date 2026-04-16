@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import html
 import hashlib
 import json
 import math
@@ -522,6 +523,9 @@ class ExportOptions:
     output_ics: Optional[Path]
     csv_fields: List[str]
     ics_desc_fields: List[str]
+    ics_desc_use_pipe_separator: bool
+    csv_field_labels: Dict[str, str]
+    ics_desc_field_labels: Dict[str, str]
 
 
 class XiQueErClient:
@@ -873,6 +877,7 @@ def export_csv(
     rows: Iterable[Dict[str, str]],
     output_path: Path,
     field_keys: List[str],
+    field_labels: Optional[Dict[str, str]] = None,
 ) -> int:
     rows = list(rows)
     if not rows:
@@ -880,7 +885,11 @@ def export_csv(
     if not field_keys:
         raise RuntimeError("CSV 字段不能为空")
 
-    headers = [CSV_FIELD_LABELS[k] for k in field_keys if k in CSV_FIELD_LABELS]
+    label_map = dict(CSV_FIELD_LABELS)
+    if field_labels:
+        label_map.update({k: str(v) for k, v in field_labels.items() if k in CSV_FIELD_LABELS and str(v).strip()})
+
+    headers = [label_map[k] for k in field_keys if k in label_map]
     if len(headers) != len(field_keys):
         raise RuntimeError("CSV 字段配置存在未知字段")
 
@@ -889,7 +898,7 @@ def export_csv(
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
         for row in rows:
-            out_row = {CSV_FIELD_LABELS[key]: str(row.get(key, "") or "") for key in field_keys}
+            out_row = {label_map[key]: str(row.get(key, "") or "") for key in field_keys}
             writer.writerow(out_row)
     return len(rows)
 
@@ -984,6 +993,8 @@ def export_ics(
     timezone_name: str,
     calendar_name: str,
     description_fields: List[str],
+    description_use_pipe_separator: bool = False,
+    description_field_labels: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Dict[str, int]]:
     now_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     stats = {
@@ -994,6 +1005,11 @@ def export_ics(
     }
 
     local_tz = ZoneInfo(timezone_name)
+    desc_label_map = dict(CSV_FIELD_LABELS)
+    if description_field_labels:
+        desc_label_map.update(
+            {k: str(v) for k, v in description_field_labels.items() if k in CSV_FIELD_LABELS and str(v).strip()}
+        )
     lines: List[str] = [
         "BEGIN:VCALENDAR",
         "PRODID:-//xiqueer-csv//CN",
@@ -1068,13 +1084,19 @@ def export_ics(
             location = escape_ics_text(str(row.get("location", "") or ""))
             desc_lines: List[str] = []
             for key in description_fields:
-                label = CSV_FIELD_LABELS.get(key)
+                label = desc_label_map.get(key)
                 if not label:
                     continue
                 value = str(row.get(key, "") or "").strip()
                 if value:
                     desc_lines.append(f"{label}:{value}")
-            description = escape_ics_text("\n".join(desc_lines))
+            description_separator = " | " if description_use_pipe_separator else "\n"
+            description = escape_ics_text(description_separator.join(desc_lines))
+            if description_use_pipe_separator:
+                alt_desc_text = " | ".join(html.escape(x) for x in desc_lines)
+            else:
+                alt_desc_text = "<br/>".join(html.escape(x) for x in desc_lines)
+            alt_desc_html = escape_ics_text(alt_desc_text)
 
             lines.extend(
                 [
@@ -1086,6 +1108,11 @@ def export_ics(
                     f"SUMMARY:{summary}",
                     f"LOCATION:{location}",
                     f"DESCRIPTION:{description}" if description else "DESCRIPTION:",
+                    (
+                        f"X-ALT-DESC;FMTTYPE=text/html:{alt_desc_html}"
+                        if alt_desc_html
+                        else "X-ALT-DESC;FMTTYPE=text/html:"
+                    ),
                     "END:VEVENT",
                 ]
             )
@@ -1114,6 +1141,7 @@ class FieldPickerFrame(ttk.LabelFrame):
         self._field_defs = field_defs
         self._all_keys = [k for k, _ in field_defs]
         self._labels = {k: v for k, v in field_defs}
+        self._custom_labels: Dict[str, str] = {}
         self._selected_keys = [k for k in default_selected if k in self._labels]
 
         left_box = ttk.Frame(self)
@@ -1121,6 +1149,7 @@ class FieldPickerFrame(ttk.LabelFrame):
         ttk.Label(left_box, text="可选字段").pack(anchor="w")
         self.left_list = tk.Listbox(left_box, selectmode=tk.EXTENDED, height=12, exportselection=False)
         self.left_list.pack(fill=tk.BOTH, expand=True)
+        self.left_list.bind("<Double-Button-1>", self._rename_from_left)
 
         btn_box = ttk.Frame(self)
         btn_box.grid(row=0, column=1, padx=8, sticky="ns")
@@ -1136,24 +1165,70 @@ class FieldPickerFrame(ttk.LabelFrame):
         ttk.Label(right_box, text="导出字段顺序").pack(anchor="w")
         self.right_list = tk.Listbox(right_box, selectmode=tk.EXTENDED, height=12, exportselection=False)
         self.right_list.pack(fill=tk.BOTH, expand=True)
+        self.right_list.bind("<Double-Button-1>", self._rename_from_right)
 
         self.columnconfigure(0, weight=1)
         self.columnconfigure(2, weight=1)
         self.rowconfigure(0, weight=1)
+        ttk.Label(self, text="提示：双击字段可重命名", foreground="#666").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0)
+        )
 
         self._default_selected = list(self._selected_keys)
         self._left_keys: List[str] = []
         self._refresh()
 
+    def _effective_label(self, key: str) -> str:
+        custom = str(self._custom_labels.get(key, "") or "").strip()
+        if custom:
+            return custom
+        return self._labels.get(key, key)
+
     def _refresh(self) -> None:
         self._left_keys = [k for k in self._all_keys if k not in self._selected_keys]
         self.left_list.delete(0, tk.END)
         for key in self._left_keys:
-            self.left_list.insert(tk.END, self._labels[key])
+            self.left_list.insert(tk.END, self._effective_label(key))
 
         self.right_list.delete(0, tk.END)
         for key in self._selected_keys:
-            self.right_list.insert(tk.END, self._labels[key])
+            self.right_list.insert(tk.END, self._effective_label(key))
+
+    def _rename_key(self, key: str) -> None:
+        current = self._effective_label(key)
+        text = simpledialog.askstring(
+            "字段重命名",
+            f"请输入字段“{current}”的新名称：",
+            initialvalue=current,
+            parent=self.winfo_toplevel(),
+        )
+        if text is None:
+            return
+        new_label = text.strip()
+        if not new_label:
+            return
+        default_label = self._labels.get(key, "")
+        if new_label == default_label:
+            self._custom_labels.pop(key, None)
+        else:
+            self._custom_labels[key] = new_label
+        self._refresh()
+
+    def _rename_from_left(self, _event: tk.Event) -> None:
+        indexes = list(self.left_list.curselection())
+        if not indexes:
+            return
+        idx = indexes[0]
+        if 0 <= idx < len(self._left_keys):
+            self._rename_key(self._left_keys[idx])
+
+    def _rename_from_right(self, _event: tk.Event) -> None:
+        indexes = list(self.right_list.curselection())
+        if not indexes:
+            return
+        idx = indexes[0]
+        if 0 <= idx < len(self._selected_keys):
+            self._rename_key(self._selected_keys[idx])
 
     def _add_selected(self) -> None:
         indexes = list(self.left_list.curselection())
@@ -1207,6 +1282,44 @@ class FieldPickerFrame(ttk.LabelFrame):
     def get_selected_keys(self) -> List[str]:
         return list(self._selected_keys)
 
+    def get_label_map(self) -> Dict[str, str]:
+        return {k: self._effective_label(k) for k in self._all_keys}
+
+
+class HoverToolTip:
+    def __init__(self, widget: tk.Widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip_window: Optional[tk.Toplevel] = None
+        self.widget.bind("<Enter>", self._show, add="+")
+        self.widget.bind("<Leave>", self._hide, add="+")
+        self.widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event: Optional[tk.Event] = None) -> None:
+        if self.tip_window is not None or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self.tip_window,
+            text=self.text,
+            justify=tk.LEFT,
+            background="#fffbe6",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=6,
+            pady=4,
+        )
+        label.pack()
+
+    def _hide(self, _event: Optional[tk.Event] = None) -> None:
+        if self.tip_window is not None:
+            self.tip_window.destroy()
+            self.tip_window = None
+
 
 class XiQueErGuiApp:
     TERM_MODE_LABEL_TO_VALUE = {
@@ -1240,6 +1353,7 @@ class XiQueErGuiApp:
         self.output_csv_var = tk.StringVar(value=DEFAULT_OUTPUT_FILE)
         self.split_by_term_var = tk.BooleanVar(value=True)
         self.export_ics_var = tk.BooleanVar(value=True)
+        self.ics_desc_pipe_var = tk.BooleanVar(value=False)
         self.output_ics_var = tk.StringVar(value="")
 
         self._build_ui()
@@ -1250,18 +1364,18 @@ class XiQueErGuiApp:
         screen_w = max(self.root.winfo_screenwidth(), 1280)
         screen_h = max(self.root.winfo_screenheight(), 720)
 
-        preferred_w = min(1240, screen_w - 120)
-        preferred_h = min(860, screen_h - 120)
-        width = max(980, preferred_w)
-        height = max(700, preferred_h)
+        preferred_w = min(1360, screen_w - 40)
+        preferred_h = min(860, screen_h - 60)
+        width = max(1140, preferred_w)
+        height = max(740, preferred_h)
 
-        if width > screen_w - 40:
-            width = max(900, screen_w - 40)
-        if height > screen_h - 60:
-            height = max(640, screen_h - 60)
+        if width > screen_w - 20:
+            width = max(980, screen_w - 20)
+        if height > screen_h - 40:
+            height = max(680, screen_h - 40)
 
-        min_w = min(width, max(860, screen_w - 120))
-        min_h = min(height, max(620, screen_h - 140))
+        min_w = min(width, 1060)
+        min_h = min(height, 680)
         self.root.minsize(min_w, min_h)
 
         x = max((screen_w - width) // 2, 0)
@@ -1271,33 +1385,43 @@ class XiQueErGuiApp:
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill=tk.X)
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, weight=0)
 
-        ttk.Label(top, text="学校").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.school_combo = ttk.Combobox(top, textvariable=self.school_var, width=22)
-        self.school_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        left = ttk.Frame(top)
+        left.grid(row=0, column=0, sticky="nsew")
+        for col in (1, 3, 5):
+            left.columnconfigure(col, weight=1)
+
+        right = ttk.LabelFrame(top, text="导出选项", padding=8)
+        right.grid(row=0, column=1, sticky="ne", padx=(10, 0))
+
+        ttk.Label(left, text="学校").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.school_combo = ttk.Combobox(left, textvariable=self.school_var)
+        self.school_combo.grid(row=0, column=1, sticky="we", padx=4, pady=4)
         self.school_combo.bind("<KeyRelease>", self._on_school_key_release)
         self.school_combo.bind("<<ComboboxSelected>>", self._on_school_combo_selected)
-        ttk.Label(top, text="账号").grid(row=0, column=2, sticky="w", padx=4, pady=4)
-        ttk.Entry(top, textvariable=self.account_var, width=16).grid(row=0, column=3, sticky="w", padx=4, pady=4)
-        ttk.Label(top, text="密码").grid(row=0, column=4, sticky="w", padx=4, pady=4)
-        ttk.Entry(top, textvariable=self.password_var, width=16, show="*").grid(
-            row=0, column=5, sticky="w", padx=4, pady=4
+        ttk.Label(left, text="账号").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        ttk.Entry(left, textvariable=self.account_var).grid(row=0, column=3, sticky="we", padx=4, pady=4)
+        ttk.Label(left, text="密码").grid(row=0, column=4, sticky="w", padx=4, pady=4)
+        ttk.Entry(left, textvariable=self.password_var, show="*").grid(
+            row=0, column=5, sticky="we", padx=4, pady=4
         )
-        ttk.Label(top, text="超时(秒)").grid(row=0, column=6, sticky="w", padx=4, pady=4)
-        ttk.Entry(top, textvariable=self.timeout_var, width=8).grid(row=0, column=7, sticky="w", padx=4, pady=4)
+        ttk.Label(left, text="超时(秒)").grid(row=0, column=6, sticky="w", padx=4, pady=4)
+        ttk.Entry(left, textvariable=self.timeout_var, width=6).grid(row=0, column=7, sticky="w", padx=4, pady=4)
 
-        ttk.Label(top, text="学期模式").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(left, text="学期模式").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         mode_box = ttk.Combobox(
-            top,
+            left,
             textvariable=self.term_mode_var,
             values=list(self.TERM_MODE_LABEL_TO_VALUE.keys()),
             state="readonly",
-            width=10,
+            width=8,
         )
         mode_box.grid(row=1, column=1, sticky="w", padx=4, pady=4)
         mode_box.bind("<<ComboboxSelected>>", lambda _e: self._update_term_codes_state())
 
-        self.term_pick_inline = ttk.Frame(top)
+        self.term_pick_inline = ttk.Frame(left)
         self.term_pick_inline.grid(row=1, column=2, columnspan=6, sticky="we", padx=4, pady=4)
         self.term_prev_btn = ttk.Button(self.term_pick_inline, text="◀", width=3, command=self._show_prev_term)
         self.term_prev_btn.pack(side=tk.LEFT)
@@ -1319,26 +1443,50 @@ class XiQueErGuiApp:
         self.term_next_btn.configure(state=tk.DISABLED)
         self.term_current_check.configure(state=tk.DISABLED)
 
-        ttk.Label(top, text="CSV 输出").grid(row=2, column=0, sticky="w", padx=4, pady=4)
-        ttk.Entry(top, textvariable=self.output_csv_var, width=55).grid(
-            row=2, column=1, columnspan=4, sticky="we", padx=4, pady=4
+        path_row = ttk.Frame(left)
+        path_row.grid(row=2, column=0, columnspan=8, sticky="we", pady=(4, 0))
+        path_row.columnconfigure(0, weight=1)
+        path_row.columnconfigure(1, weight=1)
+
+        csv_path_frame = ttk.Frame(path_row)
+        csv_path_frame.grid(row=0, column=0, sticky="we", padx=(0, 6))
+        csv_path_frame.columnconfigure(1, weight=1)
+        ttk.Label(csv_path_frame, text="CSV 输出").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(csv_path_frame, textvariable=self.output_csv_var).grid(
+            row=0, column=1, sticky="we", padx=4, pady=4
         )
-        ttk.Button(top, text="选择文件", command=self._pick_csv_output).grid(row=2, column=5, sticky="w", padx=4, pady=4)
-        ttk.Checkbutton(top, text="按学期拆分 CSV", variable=self.split_by_term_var).grid(
-            row=2, column=6, columnspan=2, sticky="w", padx=4, pady=4
+        ttk.Button(csv_path_frame, text="选择文件", command=self._pick_csv_output).grid(
+            row=0, column=2, sticky="w", padx=4, pady=4
         )
 
-        ttk.Checkbutton(top, text="导出 ICS", variable=self.export_ics_var).grid(
-            row=3, column=0, sticky="w", padx=4, pady=4
+        ics_path_frame = ttk.Frame(path_row)
+        ics_path_frame.grid(row=0, column=1, sticky="we", padx=(6, 0))
+        ics_path_frame.columnconfigure(1, weight=1)
+        ttk.Label(ics_path_frame, text="ICS 输出").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(ics_path_frame, textvariable=self.output_ics_var).grid(
+            row=0, column=1, sticky="we", padx=4, pady=4
         )
-        ttk.Label(top, text="ICS 输出").grid(row=3, column=1, sticky="e", padx=4, pady=4)
-        ttk.Entry(top, textvariable=self.output_ics_var, width=42).grid(
-            row=3, column=2, columnspan=3, sticky="we", padx=4, pady=4
+        ttk.Button(ics_path_frame, text="选择文件", command=self._pick_ics_output).grid(
+            row=0, column=2, sticky="w", padx=4, pady=4
         )
-        ttk.Button(top, text="选择文件", command=self._pick_ics_output).grid(row=3, column=5, sticky="w", padx=4, pady=4)
 
-        self.export_btn = ttk.Button(top, text="开始导出", command=self._on_export)
-        self.export_btn.grid(row=3, column=6, columnspan=2, sticky="we", padx=4, pady=4)
+        ttk.Checkbutton(right, text="按学期拆分 CSV", variable=self.split_by_term_var).pack(anchor="w")
+        ics_opt_row = ttk.Frame(right)
+        ics_opt_row.pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(ics_opt_row, text="导出 ICS", variable=self.export_ics_var).pack(side=tk.LEFT)
+        self.ics_desc_pipe_check = ttk.Checkbutton(
+            ics_opt_row,
+            text="描述用 | 分隔",
+            variable=self.ics_desc_pipe_var,
+        )
+        self.ics_desc_pipe_check.pack(side=tk.LEFT, padx=(10, 0))
+        self.ics_desc_pipe_tooltip = HoverToolTip(
+            self.ics_desc_pipe_check,
+            "勾选后 ICS 的 DESCRIPTION 使用“ | ”单行分隔，兼容部分安卓日历不识别换行。",
+        )
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        self.export_btn = ttk.Button(right, text="开始导出", command=self._on_export)
+        self.export_btn.pack(fill=tk.X)
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
@@ -1679,10 +1827,15 @@ class XiQueErGuiApp:
         csv_fields = self.csv_picker.get_selected_keys()
         if not csv_fields:
             raise RuntimeError("CSV 至少要选择一个字段")
+        csv_field_labels = self.csv_picker.get_label_map()
+        csv_selected_labels = [csv_field_labels.get(k, CSV_FIELD_LABELS.get(k, k)) for k in csv_fields]
+        if len(set(csv_selected_labels)) != len(csv_selected_labels):
+            raise RuntimeError("CSV 字段重命名后存在重复列名，请调整后再导出")
 
         desc_fields = self.desc_picker.get_selected_keys()
         if self.export_ics_var.get() and not desc_fields:
             raise RuntimeError("导出 ICS 时，DESCRIPTION 至少要选择一个字段")
+        ics_desc_field_labels = self.desc_picker.get_label_map()
 
         return ExportOptions(
             school_name=school,
@@ -1697,6 +1850,9 @@ class XiQueErGuiApp:
             output_ics=output_ics,
             csv_fields=csv_fields,
             ics_desc_fields=desc_fields,
+            ics_desc_use_pipe_separator=bool(self.ics_desc_pipe_var.get()),
+            csv_field_labels=csv_field_labels,
+            ics_desc_field_labels=ics_desc_field_labels,
         )
 
     def _ask_time_conflict_choice(self, conflicts: List[Tuple[int, PeriodTime, PeriodTime]]) -> str:
@@ -1977,7 +2133,12 @@ class XiQueErGuiApp:
         if not selected_rows:
             raise RuntimeError("所选学期没有课表数据")
 
-        total_count = export_csv(selected_rows, opts.output_csv, opts.csv_fields)
+        total_count = export_csv(
+            selected_rows,
+            opts.output_csv,
+            opts.csv_fields,
+            field_labels=opts.csv_field_labels,
+        )
         self._log(f"CSV 导出完成：{total_count} 条 -> {opts.output_csv}")
         self._log(f"时间来源：{selected_time_source or '未使用'}")
 
@@ -1990,7 +2151,12 @@ class XiQueErGuiApp:
                     continue
                 term_name = term_name_map.get(code, "")
                 out_path = opts.output_csv.parent / f"{opts.output_csv.stem}_{code}_{safe_file_component(term_name)}{suffix}"
-                count = export_csv(rows, out_path, opts.csv_fields)
+                count = export_csv(
+                    rows,
+                    out_path,
+                    opts.csv_fields,
+                    field_labels=opts.csv_field_labels,
+                )
                 split_files.append((code, out_path, count))
             self._log(f"已按学期拆分导出 {len(split_files)} 个文件")
 
@@ -2038,6 +2204,8 @@ class XiQueErGuiApp:
                         timezone_name=DEFAULT_ICS_TIMEZONE,
                         calendar_name=f"{state.school_name}_{opts.account}_课表",
                         description_fields=opts.ics_desc_fields,
+                        description_use_pipe_separator=opts.ics_desc_use_pipe_separator,
+                        description_field_labels=opts.ics_desc_field_labels,
                     )
                     ics_result = f"\nICS：{event_count} 个事件 -> {ics_output}"
                     self._log(f"ICS 导出完成：{event_count} 个事件 -> {ics_output}")
