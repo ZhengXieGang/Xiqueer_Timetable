@@ -365,6 +365,37 @@ def parse_weeks_expr(text: str) -> List[int]:
     return sorted(weeks)
 
 
+def format_weeks_expr(weeks: List[int]) -> str:
+    values = sorted({w for w in weeks if w > 0})
+    if not values:
+        return ""
+
+    parts: List[str] = []
+    start = prev = values[0]
+    for value in values[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = value
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(parts) + "周"
+
+
+def apply_week_parity_to_expr(text: str, parity_code: str) -> str:
+    code = str(parity_code or "").strip()
+    if code not in {"1", "2"}:
+        return text
+
+    weeks = parse_weeks_expr(text)
+    if not weeks:
+        return text
+
+    keep_odd = code == "1"
+    filtered = [week for week in weeks if (week % 2 == 1) == keep_odd]
+    return format_weeks_expr(filtered) or text
+
+
 def escape_ics_text(text: str) -> str:
     value = text or ""
     value = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -788,6 +819,8 @@ def flatten_term_courses(
         if not isinstance(lessons, list):
             continue
         for item in lessons:
+            raw_weeks = str(item.get("skzs", ""))
+            weeks = apply_week_parity_to_expr(raw_weeks, str(item.get("dsz", "")))
             row = {
                 "school_name": school_name,
                 "school_code": school_code,
@@ -806,7 +839,7 @@ def flatten_term_courses(
                 "course_code": str(item.get("kcdm", "")),
                 "course_alias_code": str(item.get("kcyhdm", "")),
                 "credits": str(item.get("xf", "")),
-                "weeks": str(item.get("skzs", "")),
+                "weeks": weeks,
                 "sections": str(item.get("jcxx", "")),
                 "section_codes": str(item.get("jcdm", "")),
                 "student_count": str(item.get("rs", "")),
